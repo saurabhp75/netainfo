@@ -46,3 +46,4 @@ class LSItem(scrapy.Item):
     State = Field()
     Year = Field()
     District = Field()
+    Constituency = Field()

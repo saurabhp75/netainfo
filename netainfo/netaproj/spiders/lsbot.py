@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 import scrapy
 import re
-from netaproj.items import NetaprojItem, LSItem
+from netaproj.items import LSItem
+
 
 class LsbotSpider(scrapy.Spider):
     name = 'lsbot'
@@ -9,59 +10,89 @@ class LsbotSpider(scrapy.Spider):
     start_urls = ['http://myneta.info/']
 
     def parse(self, response):
-        # get the div containing all LS eections
-        ls = response.xpath('//*[@id="main"]/div/div[2]/div/div[1]/div[3]')
-        # get individual election divs
-        ls_items = ls.css('div.items div.item')
+        """Extract Lok Sabha election years from the homepage and follow Winners links."""
+        # The homepage has a "Lok Sabha" section with election cards.
+        # Each card has links: All Candidates, Winners, etc.
+        # Filter cards that contain "Lok Sabha" text in their heading
+        ls_cards = response.css('div.w3-card.w3-border')
 
-        for ls_item in ls_items:
-            # extract text of the election
-            item_text = str.strip(ls_item.css("::text").extract_first())
-            year = item_text.split(' ')[-1]
-            url = ls_item.css("div.sub-links a:contains('All Candidates')::attr('href')").extract_first()
-            request = scrapy.Request(response.urljoin(url), callback=self.parse_state_elec)
-            request.meta['Year'] = year
+        for card in ls_cards:
+            heading = card.css('div.w3-light-gray b::text').get()
+            if not heading or 'Lok Sabha' not in heading:
+                continue
+
+            # Extract year from heading (e.g., "Lok Sabha Election 2024" -> "2024")
+            year_match = re.search(r'(\d{4})', heading)
+            if not year_match:
+                continue
+            year = year_match.group(1)
+
+            # Find the "Winners" link
+            winners_link = card.css(
+                'a:contains("Winners")::attr(href)'
+            ).get()
+            if not winners_link:
+                continue
+
+            request = scrapy.Request(
+                response.urljoin(winners_link),
+                callback=self.parse_winners
+            )
+            request.meta['Year'] = int(year)
             yield request
 
+    def parse_winners(self, response):
+        """Parse a winners page which contains both main winners and bye-election winners."""
+        year = response.meta['Year']
 
-    def parse_state_elec(self, response):
-        # states = response.css("h5.title")
-        districts = response.css('table[width="100%"] td div.items')
+        # The winners page has one or two tables:
+        # 1. "List of Winners in Lok Sabha YYYY" — main winners
+        # 2. "List of Winners in Lok Sabha YYYY Bye-Elections" — bye-election winners
+        # Both tables have the same structure.
 
-        for district in districts:
-            dist_name = str.strip(district.css('a::text').extract_first())
-            url = district.css('a::attr(href)').extract_first()
-            request = scrapy.Request(response.urljoin(url), callback=self.parse_state_year)
-            request.meta['Year'] = response.meta['Year']
-            request.meta['District'] = dist_name
-            yield request
+        # Find all candidate tables on the page (skip the summary/highlights tables)
+        tables = response.css('table.w3-table.w3-bordered')
 
-    def parse_state_year(self, response):
-        item = LSItem()
-        # Get the state name from the page
-        state = response.css('div.title h3::text').extract_first()
+        for table in tables:
+            rows = table.css('tr')
+            for row in rows:
+                cols = row.css('td')
+                if len(cols) < 8:
+                    continue  # skip header rows or empty rows
 
-        # Extract multi-word district names both lower and upper case from headings h3 text
-        m =re.search(r':((?:[A-Za-z]+ ?)+)', state)
-        state_name = str.strip(m.group(1))
-       
-        # get rows for all the candidates in a constituency
-        cand_rows = response.css('table[id="table1"] tr[onmouseover]')
+                item = LSItem()
 
-        for row in cand_rows:
-            item['Candidate'] = row.css('td')[0].css('::text').extract_first()
-            outcome = row.css('td')[0].css('font::text').extract_first()
-            if outcome:
+                # Candidate name (handles double <a> tags)
+                candidate_cell = cols[1]
+                item['Candidate'] = self._clean_text(
+                    candidate_cell.css('a::text').get()
+                )
+
+                # Winner status — everyone on this page is a winner
                 item['Winner'] = 'Yes'
-            else:
-                item['Winner'] = 'No'
-            item['Party'] = row.css('td')[1].css('::text').extract_first()
-            item['Criminal_Case'] = row.css('td')[2].css('::text').extract_first()
-            item['Education'] = row.css('td')[3].css('::text').extract_first()
-            item['Age'] = row.css('td')[4].css('::text').extract_first()
-            item['Total_Assets'] = row.css('td')[5].css('::text').extract_first()
-            item['Liabilities'] = row.css('td')[6].css('::text').extract_first()
-            item['State'] = state_name
-            item['Year'] = int(response.meta['Year'])
-            item['District'] = response.meta['District']
-            yield item
+
+                # Constituency name (may include "BYE ELECTION ON ..." for bye-elections)
+                item['Constituency'] = self._clean_text(cols[2].css('::text').get())
+
+                item['Party'] = self._clean_text(cols[3].css('::text').get())
+                item['Criminal_Case'] = self._clean_text(cols[4].css('::text').get())
+                item['Education'] = self._clean_text(cols[5].css('::text').get())
+                # Note: No Age column on winners page
+                item['Age'] = 'N/A'
+                item['Total_Assets'] = self._clean_text(cols[6].css('::text').get()) or 'N/A'
+                item['Liabilities'] = self._clean_text(cols[7].css('::text').get()) or 'N/A'
+
+                # The winners page doesn't provide State/District — only Constituency
+                # These can be derived from the election context
+                item['State'] = 'See Constituency'
+                item['District'] = 'See Constituency'
+                item['Year'] = year
+
+                yield item
+
+    @staticmethod
+    def _clean_text(text):
+        """Strip whitespace and return None for empty strings."""
+        if text:
+            return text.strip()
+        return None

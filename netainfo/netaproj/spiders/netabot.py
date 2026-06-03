@@ -7,87 +7,129 @@ from netaproj.items import NetaprojItem
 class NetabotSpider(scrapy.Spider):
     name = 'netabot'
     allowed_domains = ['myneta.info']
-    start_urls = ['http://myneta.info//']
+    start_urls = ['http://myneta.info/']
 
     def parse(self, response):
-        # Get the state urls
-        state_urls = response.css('div.grid_3 .item>a')
-
-        #create a request for each state
-        for url in state_urls:
-            # get url of the state
-            url_state = url.css('a::attr("href")').extract_first()
-            request = scrapy.Request(response.urljoin(url_state), callback=self.parse_state_item)
-            # get name of the state and pass to response
-            request.meta['State'] = url.css('a::text').extract_first()
+        """Extract state links from the State Assemblies section on the homepage."""
+        # Find all state assembly links: state_assembly.php?state=STATE_NAME
+        state_links = response.css(
+            'a[href*="state_assembly.php?state="]'
+        )
+        for link in state_links:
+            state_name = link.css('::text').get()
+            state_url = link.attrib['href']
+            request = scrapy.Request(
+                response.urljoin(state_url),
+                callback=self.parse_state
+            )
+            request.meta['State'] = state_name.strip() if state_name else ''
             yield request
 
-    
-    def parse_state_item(self, response):
-        # Get all election years of the state
-        election_years = response.css("div.grid_6 div.items div.item")
+    def parse_state(self, response):
+        """Parse a state page to get all election years and their 'All Candidates' links."""
+        # Each election year is in <div class='w3-panel w3-leftbar w3-pale-yellow'><h4>STATE YEAR</h4></div>
+        # followed by <ul class="w3-ul"> with links
+        election_headers = response.css(
+            'div.w3-panel.w3-leftbar.w3-pale-yellow h4::text'
+        ).getall()
 
-        # for each year extract 'All candidates link'
-        for election_year in election_years:
-            #extract link for 'All Candidates'
-            url = election_year.css('a:contains("All Candidates")::attr("href")').extract_first()
-            request = scrapy.Request(response.urljoin(url), callback=self.parse_state_elec)
-            # Get the year of election
-            year_of_election = str.strip(election_year.css('div.item h3::text').extract_first())
-            request.meta['Year'] = year_of_election.split(" ")[-1]
+        election_uls = response.css(
+            'div.w3-panel.w3-leftbar.w3-pale-yellow + ul.w3-ul'
+        )
+
+        for header, ul_elem in zip(election_headers, election_uls):
+            # Extract the year from the header text (e.g., "Delhi 2025" -> "2025")
+            year_match = re.search(r'(\d{4})', header)
+            if not year_match:
+                continue
+            year = year_match.group(1)
+
+            # Find "All Candidates" link
+            all_cand_link = ul_elem.css(
+                'a:contains("All Candidates")::attr(href)'
+            ).get()
+            if not all_cand_link:
+                continue
+
+            request = scrapy.Request(
+                response.urljoin(all_cand_link),
+                callback=self.parse_election
+            )
             request.meta['State'] = response.meta['State']
-            yield request
-    
-    
-    def parse_state_elec(self, response):
-        # Get all the constituency divs from the table
-        const_divs = response.css('table[width="100%"] td div.items')
-
-        for row in const_divs:
-            # Get the url for each constituency
-            url = row.css('a::attr(href)').extract_first()
-
-            request = scrapy.Request(response.urljoin(url), callback=self.parse_const_cand)
-            request.meta['Year'] = response.meta['Year']
-            request.meta['State'] = response.meta['State']
-            request.meta['Constituency'] = row.css('a::text').extract_first()
-
+            request.meta['Year'] = int(year)
             yield request
 
-    def parse_const_cand(self, response):
-        item = NetaprojItem()
+    def parse_election(self, response):
+        """Parse the election page listing constituencies by district dropdowns."""
+        # Each district has a dropdown with constituency links
+        # Constituency links: href=index.php?action=show_candidates&constituency_id=XX
+        # The district name is on the button text
+        dropdowns = response.css('div.w3-dropdown-click')
 
-        # Get the district name from the page
-        district = response.css('div.title h3::text').extract_first()
-        # Extract multi-word district names both lower and upper case from headings h3 text
-        dis_name = re.search(r':(([A-Za-z]+ ?)+)', district)
-        
-        # get rows for all the candidates in a constituency
-        cand_rows = response.css('table[id="table1"] tr[onmouseover]')
+        for dropdown in dropdowns:
+            # Get district name from the button text
+            button_text = dropdown.css('button::text').get()
+            if not button_text:
+                continue
+            district_name = button_text.strip()
 
-        for row in cand_rows:
-            item['Candidate'] = row.css('td')[0].css('::text').extract_first()
-            outcome = row.css('td')[0].css('font::text').extract_first()
-            if outcome:
-                item['Winner'] = 'Yes'
-            else:
-                item['Winner'] = 'No'
-            item['Party'] = row.css('td')[1].css('::text').extract_first()
-            item['Criminal_Case'] = row.css('td')[2].css('::text').extract_first()
-            item['Education'] = row.css('td')[3].css('::text').extract_first()
-            item['Age'] = row.css('td')[4].css('::text').extract_first()
-            item['Total_Assets'] = row.css('td')[5].css('::text').extract_first()
-            item['Liabilities'] = row.css('td')[6].css('::text').extract_first()
+            # Get constituency links
+            const_links = dropdown.css(
+                'div.w3-dropdown-content a[href*="show_candidates"]'
+            )
+            for const_link in const_links:
+                const_name = const_link.css('::text').get()
+                const_url = const_link.attrib['href']
+
+                request = scrapy.Request(
+                    response.urljoin(const_url),
+                    callback=self.parse_constituency
+                )
+                request.meta['State'] = response.meta['State']
+                request.meta['Year'] = response.meta['Year']
+                request.meta['District'] = district_name.strip()
+                request.meta['Constituency'] = const_name.strip() if const_name else ''
+                yield request
+
+    def parse_constituency(self, response):
+        """Parse the candidate listing table for a constituency."""
+        # New table structure: <table class='w3-table w3-bordered'>
+        # Header row: SNo | Candidate | Party | Criminal Cases | Education | Age | Total Assets | Liabilities
+        rows = response.css('table.w3-table.w3-bordered tr')
+
+        for row in rows:
+            cols = row.css('td')
+            if len(cols) < 8:
+                continue  # skip header row or empty rows
+
+            item = NetaprojItem()
+
+            # Candidate name and winner status
+            candidate_cell = cols[1]
+            item['Candidate'] = self._clean_text(
+                candidate_cell.css('a::text').get()
+            )
+            # Check if winner (green font with "Winner")
+            winner_text = candidate_cell.css('font[color="green"]::text').get()
+            item['Winner'] = 'Yes' if winner_text and 'Winner' in winner_text else 'No'
+
+            item['Party'] = self._clean_text(cols[2].css('::text').get())
+            item['Criminal_Case'] = self._clean_text(cols[3].css('::text').get())
+            item['Education'] = self._clean_text(cols[4].css('::text').get())
+            item['Age'] = self._clean_text(cols[5].css('::text').get())
+            item['Total_Assets'] = self._clean_text(cols[6].css('::text').get()) or 'N/A'
+            item['Liabilities'] = self._clean_text(cols[7].css('::text').get()) or 'N/A'
+
             item['State'] = response.meta['State']
-            item['Year'] = int(response.meta['Year'])
+            item['Year'] = response.meta['Year']
+            item['District'] = response.meta['District']
             item['Constituency'] = response.meta['Constituency']
-            item['District'] = dis_name.group(1)
+
             yield item
 
-        
-
-
-
-
-
-
+    @staticmethod
+    def _clean_text(text):
+        """Strip whitespace and return None for empty strings."""
+        if text:
+            return text.strip()
+        return None
